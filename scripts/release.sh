@@ -124,7 +124,7 @@ Diffstat: ${diffstat}"
 echo "Updating version to $VERSION..."
 
 # Update Cargo.toml version
-sed -i '' "s/^version = \".*\"/version = \"$VERSION\"/" dsdk-cli/Cargo.toml
+sed -i.bak "s/^version = \".*\"/version = \"$VERSION\"/" dsdk-cli/Cargo.toml && rm -f dsdk-cli/Cargo.toml.bak
 
 # Regenerate Cargo.lock with new versions
 echo "Updating Cargo.lock..."
