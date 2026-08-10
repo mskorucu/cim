@@ -1134,6 +1134,127 @@ pub(crate) fn install_python_packages_from_file(
     Ok(())
 }
 
+/// Extract the package manager program name from a configured `command:` string.
+///
+/// Strips any leading path so both "apt-get install" and "/usr/bin/apt-get install"
+/// resolve to "apt-get".
+fn package_manager_program(command: &str) -> &str {
+    command
+        .split_whitespace()
+        .next()
+        .unwrap_or("")
+        .rsplit('/')
+        .next()
+        .unwrap_or("")
+}
+
+/// Returns the flag that makes `program` skip its own confirmation prompt.
+///
+/// `None` means no flag is needed or none is known: brew never prompts and
+/// rejects `-y`, and unknown package managers are left untouched.
+fn assume_yes_flag(program: &str) -> Option<&'static str> {
+    match program {
+        "apt" | "apt-get" | "aptitude" | "dnf" | "yum" | "zypper" => Some("-y"),
+        "pacman" => Some("--noconfirm"),
+        _ => None,
+    }
+}
+
+/// Returns true if the configured command already opts out of confirmation.
+///
+/// Detection is package-manager aware: only the apt/rpm families treat a short
+/// flag cluster containing 'y' as assume-yes. For pacman, `-Sy` refreshes the
+/// package database and says nothing about confirmation, so only `--noconfirm`
+/// counts. This keeps flag injection idempotent without misreading flags.
+fn has_assume_yes_flag(command: &str) -> bool {
+    let program = package_manager_program(command);
+    let mut tokens = command.split_whitespace().skip(1);
+    let short_cluster_means_yes = matches!(
+        program,
+        "apt" | "apt-get" | "aptitude" | "dnf" | "yum" | "zypper"
+    );
+
+    tokens.any(|token| {
+        matches!(
+            token,
+            "--yes" | "--assume-yes" | "--assumeyes" | "--noconfirm"
+        ) || (short_cluster_means_yes
+            && token.starts_with('-')
+            && !token.starts_with("--")
+            && token.contains('y'))
+    })
+}
+
+/// Returns the assume-yes arguments needed to run `command` non-interactively.
+///
+/// The `--yes` flag suppresses cim's own confirmation prompt, but the package
+/// manager has its own prompt that must be suppressed separately or the install
+/// hangs waiting on stdin (e.g. apt's "Do you want to continue? [Y/n]").
+///
+/// Returns an empty vec when no flag is needed (brew never prompts), when the
+/// package manager is unknown, or when the configured command already opts in.
+fn assume_yes_args(command: &str) -> Vec<String> {
+    if has_assume_yes_flag(command) {
+        return Vec::new();
+    }
+
+    assume_yes_flag(package_manager_program(command))
+        .map(|flag| vec![flag.to_string()])
+        .unwrap_or_default()
+}
+
+/// Returns true if the package manager uses debconf and needs a non-interactive frontend.
+///
+/// Even with `-y`, packages such as tzdata and keyboard-configuration open a
+/// debconf dialog that blocks on stdin, which would hang an unattended run.
+fn needs_noninteractive_frontend(command: &str) -> bool {
+    matches!(
+        package_manager_program(command),
+        "apt" | "apt-get" | "aptitude"
+    )
+}
+
+/// Returns the `VAR=value` arguments to pass through sudo for an unattended install.
+///
+/// `sudo` resets the environment by default, so setting DEBIAN_FRONTEND on the
+/// sudo process itself would never reach the package manager. Passing it as a
+/// leading argument to sudo is the documented way to propagate it.
+fn sudo_env_prefix(command: &str, skip_prompt: bool) -> Vec<String> {
+    if skip_prompt && needs_noninteractive_frontend(command) {
+        vec!["DEBIAN_FRONTEND=noninteractive".to_string()]
+    } else {
+        Vec::new()
+    }
+}
+
+/// Build the full argv for the package installation command.
+///
+/// Returns `[program, args...]`, or an empty vec if `command` is blank. Layout:
+/// `sudo [DEBIAN_FRONTEND=noninteractive] <command...> [assume-yes] <packages...>`
+fn build_install_args(
+    command: &str,
+    packages: &[String],
+    needs_sudo: bool,
+    skip_prompt: bool,
+) -> Vec<String> {
+    let command_parts: Vec<String> = command.split_whitespace().map(String::from).collect();
+    if command_parts.is_empty() {
+        return Vec::new();
+    }
+
+    let mut argv: Vec<String> = Vec::new();
+    if needs_sudo {
+        argv.push("sudo".to_string());
+        argv.extend(sudo_env_prefix(command, skip_prompt));
+    }
+    argv.extend(command_parts);
+    if skip_prompt {
+        argv.extend(assume_yes_args(command));
+    }
+    argv.extend(packages.iter().cloned());
+    argv
+}
+
 /// Install prerequisites based on OS dependencies configuration
 pub(crate) fn install_prerequisites(
     os_deps: &config::OsDependencies,
@@ -1232,43 +1353,44 @@ pub(crate) fn install_prerequisites(
                 messages::status("\nProceeding with installation (--yes flag specified)...");
             }
 
+            let pm_command = &distro_config.package_manager.command;
+
+            // Warn once if we cannot make an unknown package manager unattended.
+            if skip_prompt
+                && assume_yes_flag(package_manager_program(pm_command)).is_none()
+                && !has_assume_yes_flag(pm_command)
+                && !matches!(package_manager_program(pm_command), "brew" | "")
+            {
+                messages::info(&format!(
+                    "Unknown package manager '{}': cannot infer an assume-yes flag. Add one to the 'command:' field in os-dependencies.yml if the install prompts.",
+                    package_manager_program(pm_command)
+                ));
+            }
+
             // Build the full command with sudo if needed
-            let mut cmd_parts: Vec<String> = Vec::new();
-
-            // Add sudo as the first command if needed
-            let (program, initial_args): (&str, Vec<String>) = if needs_sudo {
-                cmd_parts.push("sudo".to_string());
-                cmd_parts.extend(
-                    distro_config
-                        .package_manager
-                        .command
-                        .split_whitespace()
-                        .map(String::from),
-                );
-                ("sudo", cmd_parts[1..].to_vec())
-            } else {
-                cmd_parts.extend(
-                    distro_config
-                        .package_manager
-                        .command
-                        .split_whitespace()
-                        .map(String::from),
-                );
-                (cmd_parts[0].as_str(), cmd_parts[1..].to_vec())
-            };
-
-            // Add packages to install
-            let mut all_args = initial_args;
-            all_args.extend(packages.iter().cloned());
+            let mut cmd_parts: Vec<String> =
+                build_install_args(pm_command, &packages, needs_sudo, skip_prompt);
 
             if cmd_parts.is_empty() {
                 messages::error("No installation command found");
                 return;
             }
 
+            let program = cmd_parts.remove(0);
+            let all_args = cmd_parts;
+
             messages::status(&format!("\nRunning: {} {}", program, all_args.join(" ")));
 
-            match std::process::Command::new(program).args(&all_args).status() {
+            let mut install_cmd = std::process::Command::new(&program);
+            install_cmd.args(&all_args);
+
+            // Without sudo there is no environment reset, so set the frontend
+            // directly. With sudo it is passed as a VAR=value argument instead.
+            if !needs_sudo && skip_prompt && needs_noninteractive_frontend(pm_command) {
+                install_cmd.env("DEBIAN_FRONTEND", "noninteractive");
+            }
+
+            match install_cmd.status() {
                 Ok(status) if status.success() => {
                     messages::success("Successfully installed OS dependencies");
                 }
@@ -1495,5 +1617,189 @@ mod tests {
             .expect("Failed to assert Python prefix");
 
         assert!(output.status.success());
+    }
+
+    #[test]
+    fn test_assume_yes_args_apt_family() {
+        assert_eq!(assume_yes_args("apt-get install"), vec!["-y".to_string()]);
+        assert_eq!(assume_yes_args("apt install"), vec!["-y".to_string()]);
+        assert_eq!(
+            assume_yes_args("apt-get install --no-install-recommends"),
+            vec!["-y".to_string()]
+        );
+    }
+
+    #[test]
+    fn test_assume_yes_args_rpm_family() {
+        assert_eq!(assume_yes_args("dnf install"), vec!["-y".to_string()]);
+        assert_eq!(assume_yes_args("yum install"), vec!["-y".to_string()]);
+        assert_eq!(assume_yes_args("zypper install"), vec!["-y".to_string()]);
+    }
+
+    #[test]
+    fn test_assume_yes_args_pacman() {
+        assert_eq!(
+            assume_yes_args("pacman -S"),
+            vec!["--noconfirm".to_string()]
+        );
+    }
+
+    #[test]
+    fn test_assume_yes_args_no_flag_needed() {
+        // brew never prompts for confirmation and rejects -y
+        assert!(assume_yes_args("brew install").is_empty());
+        // Unknown package managers get no injected flag
+        assert!(assume_yes_args("mystery-pm add").is_empty());
+        assert!(assume_yes_args("").is_empty());
+    }
+
+    #[test]
+    fn test_assume_yes_args_is_idempotent() {
+        // A manifest that already opts in must not get a duplicate flag
+        assert!(assume_yes_args("apt-get install -y").is_empty());
+        assert!(assume_yes_args("apt-get -y install").is_empty());
+        assert!(assume_yes_args("apt-get install -qy").is_empty());
+        assert!(assume_yes_args("dnf install --assumeyes").is_empty());
+        assert!(assume_yes_args("pacman -S --noconfirm").is_empty());
+    }
+
+    #[test]
+    fn test_assume_yes_args_pacman_sy_is_not_assume_yes() {
+        // pacman's -y refreshes the package database; it does not skip the
+        // confirmation prompt, so --noconfirm is still required.
+        assert_eq!(
+            assume_yes_args("pacman -Sy"),
+            vec!["--noconfirm".to_string()]
+        );
+        assert_eq!(
+            assume_yes_args("pacman -Syu"),
+            vec!["--noconfirm".to_string()]
+        );
+    }
+
+    #[test]
+    fn test_assume_yes_args_absolute_path_command() {
+        // Commands may be given with a full path
+        assert_eq!(
+            assume_yes_args("/usr/bin/apt-get install"),
+            vec!["-y".to_string()]
+        );
+    }
+
+    #[test]
+    fn test_needs_noninteractive_frontend() {
+        // Only the Debian family uses debconf
+        assert!(needs_noninteractive_frontend("apt-get install"));
+        assert!(needs_noninteractive_frontend("apt install"));
+        assert!(needs_noninteractive_frontend("/usr/bin/apt-get install"));
+        assert!(!needs_noninteractive_frontend("dnf install"));
+        assert!(!needs_noninteractive_frontend("brew install"));
+    }
+
+    fn pkgs(names: &[&str]) -> Vec<String> {
+        names.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn test_build_install_args_apt_unattended_with_sudo() {
+        // The regression this fixes: --yes must reach apt, not just cim's prompt.
+        let argv = build_install_args("apt-get install", &pkgs(&["git", "curl"]), true, true);
+        assert_eq!(
+            argv,
+            pkgs(&[
+                "sudo",
+                "DEBIAN_FRONTEND=noninteractive",
+                "apt-get",
+                "install",
+                "-y",
+                "git",
+                "curl",
+            ])
+        );
+    }
+
+    #[test]
+    fn test_build_install_args_apt_interactive_unchanged() {
+        // Without --yes, behavior must be exactly as before: no -y, no frontend override.
+        let argv = build_install_args("apt-get install", &pkgs(&["git"]), true, false);
+        assert_eq!(argv, pkgs(&["sudo", "apt-get", "install", "git"]));
+    }
+
+    #[test]
+    fn test_build_install_args_no_sudo_omits_env_prefix() {
+        // Without sudo there is no env reset, so the prefix is not needed here.
+        let argv = build_install_args("apt-get install", &pkgs(&["git"]), false, true);
+        assert_eq!(argv, pkgs(&["apt-get", "install", "-y", "git"]));
+    }
+
+    #[test]
+    fn test_build_install_args_assume_yes_precedes_packages() {
+        // apt requires flags before the package list to be parsed reliably.
+        let argv = build_install_args("apt-get install", &pkgs(&["git"]), false, true);
+        let y = argv.iter().position(|a| a == "-y").expect("-y missing");
+        let g = argv.iter().position(|a| a == "git").expect("git missing");
+        assert!(
+            y < g,
+            "assume-yes flag must come before packages: {:?}",
+            argv
+        );
+    }
+
+    #[test]
+    fn test_build_install_args_brew_gets_no_flag_or_frontend() {
+        // brew rejects -y and macOS has no debconf.
+        let argv = build_install_args("brew install", &pkgs(&["cmake"]), false, true);
+        assert_eq!(argv, pkgs(&["brew", "install", "cmake"]));
+    }
+
+    #[test]
+    fn test_build_install_args_dnf_and_pacman() {
+        assert_eq!(
+            build_install_args("dnf install", &pkgs(&["gcc"]), true, true),
+            pkgs(&["sudo", "dnf", "install", "-y", "gcc"])
+        );
+        // pacman is not Debian-family, so no DEBIAN_FRONTEND prefix
+        assert_eq!(
+            build_install_args("pacman -S", &pkgs(&["gcc"]), true, true),
+            pkgs(&["sudo", "pacman", "-S", "--noconfirm", "gcc"])
+        );
+    }
+
+    #[test]
+    fn test_build_install_args_preserves_extra_command_flags() {
+        let argv = build_install_args(
+            "apt-get install --no-install-recommends",
+            &pkgs(&["git"]),
+            false,
+            true,
+        );
+        assert_eq!(
+            argv,
+            pkgs(&["apt-get", "install", "--no-install-recommends", "-y", "git"])
+        );
+    }
+
+    #[test]
+    fn test_build_install_args_no_duplicate_flag_when_manifest_opts_in() {
+        let argv = build_install_args("apt-get install -y", &pkgs(&["git"]), false, true);
+        assert_eq!(argv.iter().filter(|a| *a == "-y").count(), 1);
+        assert_eq!(argv, pkgs(&["apt-get", "install", "-y", "git"]));
+    }
+
+    #[test]
+    fn test_build_install_args_empty_command() {
+        assert!(build_install_args("", &pkgs(&["git"]), true, true).is_empty());
+        assert!(build_install_args("   ", &pkgs(&["git"]), true, true).is_empty());
+    }
+
+    #[test]
+    fn test_sudo_env_prefix() {
+        assert_eq!(
+            sudo_env_prefix("apt-get install", true),
+            pkgs(&["DEBIAN_FRONTEND=noninteractive"])
+        );
+        // Interactive runs must keep the normal frontend so debconf dialogs work
+        assert!(sudo_env_prefix("apt-get install", false).is_empty());
+        assert!(sudo_env_prefix("dnf install", true).is_empty());
     }
 }
